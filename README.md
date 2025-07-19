@@ -10,7 +10,6 @@ A Flask-based REST API for managing Podman containers with comprehensive contain
 - [API Endpoints](#api-endpoints)
 - [Error Handling](#error-handling)
 - [Examples](#examples)
-- [Testing](#testing)
 
 ## Overview
 
