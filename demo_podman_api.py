@@ -49,8 +49,8 @@ def handle_errors(func):
             raise PodmanAPIError("Operation timed out", 408)
         except Exception as e:
             logger.error(f"Error in {func.__name__}: {str(e)}")
-            if "not found" in str(e).lower():
-                raise PodmanAPIError("Container not found", 404)
+            if "not found" in str(e).lower() or "no such" in str(e).lower():
+                raise PodmanAPIError("Resource not found", 404)
             else:
                 raise PodmanAPIError(f"Podman error: {str(e)}", 500)
     return wrapper
@@ -106,6 +106,29 @@ class PodmanAPI:
         output_str = output.decode('utf-8') if isinstance(output, bytes) else str(output)
         return exit_code, output_str
 
+    def _safe_get_attr(self, obj, path, default="unknown"):
+        """Safely get nested attributes from container objects"""
+        try:
+            current = obj
+            for key in path:
+                if hasattr(current, 'get') and callable(getattr(current, 'get')):
+                    current = current.get(key, {})
+                elif hasattr(current, key):
+                    current = getattr(current, key)
+                else:
+                    return default
+            
+            # Ensure we return a string, not a dict or other object
+            if current is None:
+                return default
+            elif isinstance(current, (dict, list)):
+                return str(current)
+            else:
+                return str(current)
+        except Exception as e:
+            logger.debug(f"Error getting attribute {path}: {e}")
+            return default
+
     @handle_errors
     def create_container(self, config):
         logger.info(f"Creating container: {config.get('name')}")
@@ -130,10 +153,15 @@ class PodmanAPI:
                 
                 container_info = client.containers.get(config.get("name"))
                 
+                # Get attributes more safely
+                container_id = self._safe_get_attr(container_info, ['attrs', 'Id'], "")
+                container_name = self._safe_get_attr(container_info, ['attrs', 'Name'], "")
+                container_status = self._safe_get_attr(container_info, ['attrs', 'State', 'Status'], "unknown")
+                
                 result = {
-                    "id": container_info.attrs.get("Id", "")[:12],
-                    "name": container_info.attrs.get("Name", "").lstrip("/"),
-                    "status": container_info.attrs.get("State", {}).get("Status", "unknown"),
+                    "id": container_id[:12] if container_id else "",
+                    "name": container_name.lstrip("/") if container_name and isinstance(container_name, str) else container_name,
+                    "status": container_status,
                 }
                 
                 return result
@@ -178,6 +206,7 @@ class PodmanAPI:
 
         return asyncio.run(self._run_async(_remove))
 
+    @handle_errors
     def list_containers(self):
         logger.debug("Listing containers")
         
@@ -187,13 +216,30 @@ class PodmanAPI:
                 result = []
                 
                 for container in containers:
-                    attrs = container.attrs
-                    result.append({
-                        "id": attrs.get("Id", "")[:12],
-                        "name": attrs.get("Name", "").lstrip("/"),
-                        "status": attrs.get("State", {}).get("Status", "unknown"),
-                        "image": attrs.get("Config", {}).get("Image", "unknown"),
-                    })
+                    try:
+                        # Get raw attributes
+                        container_id = self._safe_get_attr(container, ['attrs', 'Id'], "")
+                        container_name = self._safe_get_attr(container, ['attrs', 'Name'], "")
+                        container_status = self._safe_get_attr(container, ['attrs', 'State', 'Status'], "unknown")
+                        container_image = self._safe_get_attr(container, ['attrs', 'Config', 'Image'], "unknown")
+                        
+                        # Process the data safely
+                        container_data = {
+                            "id": container_id[:12] if container_id else "",
+                            "name": container_name.lstrip("/") if container_name and isinstance(container_name, str) else str(container_name),
+                            "status": container_status,
+                            "image": container_image,
+                        }
+                        result.append(container_data)
+                    except Exception as e:
+                        logger.error(f"Error processing container: {e}")
+                        # Add a minimal entry for problematic containers
+                        result.append({
+                            "id": "error",
+                            "name": "error",
+                            "status": "error",
+                            "image": "error"
+                        })
                 
                 return result
 
@@ -205,9 +251,38 @@ class PodmanAPI:
         
         def _get_logs():
             with self._get_client() as client:
-                container = client.containers.get(name)
-                logs = container.logs(tail=tail)
-                return {"logs": logs.decode('utf-8') if isinstance(logs, bytes) else str(logs)}
+                try:
+                    container = client.containers.get(name)
+                    container.reload()
+                    
+                    # Try different approaches to get logs
+                    try:
+                        logs = container.logs(tail=tail)
+                    except Exception as e:
+                        logger.warning(f"Failed to get logs with tail parameter: {e}")
+                        logs = container.logs()
+                    
+                    if logs is None:
+                        return {"logs": "No logs available"}
+                    
+                    # Handle different return types
+                    if isinstance(logs, bytes):
+                        log_content = logs.decode('utf-8', errors='replace')
+                    elif isinstance(logs, str):
+                        log_content = logs
+                    else:
+                        log_content = str(logs)
+                    
+                    # Limit output if no tail was applied
+                    if tail and len(log_content.split('\n')) > tail:
+                        lines = log_content.split('\n')
+                        log_content = '\n'.join(lines[-tail:])
+                    
+                    return {"logs": log_content}
+                    
+                except Exception as e:
+                    logger.error(f"Error getting logs for {name}: {e}")
+                    return {"logs": f"Error retrieving logs: {str(e)}"}
 
         return asyncio.run(self._run_async(_get_logs))
 
